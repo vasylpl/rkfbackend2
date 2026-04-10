@@ -79,7 +79,9 @@ function authAdmin(req, res, next) {
 const databaseUrl = process.env.DATABASE_URL;
 const pool = new Pool({
     connectionString: databaseUrl,
-    ssl: databaseUrl && databaseUrl.includes('supabase.com') ? { rejectUnauthorized: false } : undefined
+    // Supabase pooler can present a cert chain that Node doesn't fully trust in some environments.
+    // Disabling cert verification here is a pragmatic workaround for managed Postgres over TLS.
+    ssl: databaseUrl ? { rejectUnauthorized: false } : undefined
 });
 
 process.on('unhandledRejection', (reason) => {
