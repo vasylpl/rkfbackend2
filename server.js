@@ -187,10 +187,13 @@ app.get('/settings', async (req, res) => {
         if (result.rows.length === 0) {
             return res.json({ 
                 title: 'Římskokatolická farnost Přeštice', 
-                background_color: '#F5F2EB' 
+                background_color: '#F5F2EB',
+                ohlasky: ''
             });
         }
-        res.json(result.rows[0]);
+        const row = result.rows[0];
+        if (row.ohlasky == null) row.ohlasky = '';
+        res.json(row);
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -198,17 +201,29 @@ app.get('/settings', async (req, res) => {
 
 app.post('/settings', authAdmin, async (req, res) => {
     try {
-        const { title, background_color, backgroundColor } = req.body || {};
+        const { title, background_color, backgroundColor, ohlasky } = req.body || {};
         const bg = typeof background_color === 'string' ? background_color : backgroundColor;
-        if (typeof title !== 'string' || typeof bg !== 'string') {
-            return res.status(400).json({ error: 'Invalid payload' });
-        }
+        if (title != null && typeof title !== 'string') return res.status(400).json({ error: 'Invalid title' });
+        if (bg != null && typeof bg !== 'string') return res.status(400).json({ error: 'Invalid background_color' });
+        if (ohlasky != null && typeof ohlasky !== 'string') return res.status(400).json({ error: 'Invalid ohlasky' });
 
         await pool.query(
-            `INSERT INTO settings (id, title, background_color)
-             VALUES (1, $1, $2)
-             ON CONFLICT (id) DO UPDATE SET title = EXCLUDED.title, background_color = EXCLUDED.background_color`,
-            [title, bg]
+            `INSERT INTO settings (id, title, background_color, ohlasky)
+             VALUES (
+               1,
+               COALESCE($1, 'Římskokatolická farnost Přeštice'),
+               COALESCE($2, '#F5F2EB'),
+               COALESCE($3, '')
+             )
+             ON CONFLICT (id) DO UPDATE SET
+               title = COALESCE($1, settings.title),
+               background_color = COALESCE($2, settings.background_color),
+               ohlasky = COALESCE($3, settings.ohlasky)`,
+            [
+                title == null ? null : title,
+                bg == null ? null : bg,
+                ohlasky == null ? null : ohlasky
+            ]
         );
         res.json({ message: 'Uloženo' });
     } catch (err) {
@@ -220,16 +235,27 @@ app.post('/settings', authAdmin, async (req, res) => {
 // --- 5. AKCE ---
 app.get('/events', async (req, res) => {
     try {
-        const result = await pool.query('SELECT * FROM events ORDER BY id DESC');
-        res.json(result.rows);
+        const result = await pool.query(`
+            SELECT
+              e.*,
+              COALESCE(
+                ARRAY_REMOVE(ARRAY_AGG(s.label ORDER BY s.id), NULL),
+                '{}'
+              ) AS timeslots
+            FROM events e
+            LEFT JOIN event_slots s ON s.event_id = e.id
+            GROUP BY e.id
+            ORDER BY e.id DESC
+        `);
+        return res.json(result.rows);
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        return res.status(500).json({ error: err.message });
     }
 });
 
 app.post('/events', authAdmin, async (req, res) => {
     try {
-        const { time, name, is_reservable, capacity, reservation_mode } = req.body || {};
+        const { time, name, is_reservable, capacity, reservation_mode, timeslots } = req.body || {};
         if (typeof time !== 'string' || typeof name !== 'string') {
             return res.status(400).json({ error: 'Invalid payload' });
         }
@@ -238,13 +264,34 @@ app.post('/events', authAdmin, async (req, res) => {
         if (!cap) return res.status(400).json({ error: 'Invalid capacity' });
         if (!mode) return res.status(400).json({ error: 'Invalid reservation_mode' });
 
-        await pool.query(
+        const inserted = await pool.query(
             'INSERT INTO events (time, name, is_reservable, capacity, reservation_mode) VALUES ($1, $2, $3, $4, $5)',
             [time.trim(), name.trim(), Boolean(is_reservable), cap, mode]
         );
-        res.json({ message: 'Akce přidána' });
+
+        // If timeslots provided, store them in event_slots as labels.
+        if (Array.isArray(timeslots) && timeslots.length > 0) {
+            const event = await queryOne('SELECT id FROM events ORDER BY id DESC LIMIT 1', []);
+            if (event?.id) {
+                const labels = timeslots
+                    .filter(v => typeof v === 'string')
+                    .map(v => v.trim())
+                    .filter(v => v.length > 0);
+
+                if (labels.length > 0) {
+                    await pool.query(
+                        `INSERT INTO event_slots (event_id, label)
+                         SELECT $1, x
+                         FROM UNNEST($2::text[]) AS x`,
+                        [event.id, labels]
+                    );
+                }
+            }
+        }
+
+        return res.json({ message: 'Akce přidána' });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        return res.status(500).json({ error: err.message });
     }
 });
 
@@ -412,10 +459,11 @@ app.get('/reservations', authAdmin, async (req, res) => {
 
 app.post('/reservations', async (req, res) => {
     try {
-        const { event_id, slot_id, group_name, people_count, email } = req.body || {};
+        const { event_id, slot_id, timeslot, group_name, people_count, email } = req.body || {};
 
         const eventId = parsePositiveInt(event_id);
         const slotId = slot_id == null ? null : parsePositiveInt(slot_id);
+        const timeSlotLabel = typeof timeslot === 'string' ? timeslot.trim() : null;
         const people = parsePositiveInt(people_count);
         if (!eventId) return res.status(400).json({ error: 'Invalid event_id' });
         if (typeof group_name !== 'string' || group_name.trim().length === 0) {
@@ -433,16 +481,20 @@ app.post('/reservations', async (req, res) => {
         const cap = Number(ev.capacity || 30);
         if (people > cap) return res.status(400).json({ error: `Maximální kapacita je ${cap} osob.` });
 
-        // Slot logic (optional). If event_slots exists and slot_id provided, enforce slot capacity.
+        // Slot logic for variant A:
+        // - Accept `timeslot` (label) from frontend, map it to `event_slots.id` if it exists.
+        // - Keep `slot_id` compatibility as well.
         let finalSlotId = null;
-        if (slotId) {
-            const slot = await queryOne(
-                'SELECT id, capacity, reserved_count FROM event_slots WHERE id = $1 AND event_id = $2',
-                [slotId, eventId]
-            );
+        if (timeSlotLabel) {
+            const slot = await queryOne('SELECT id FROM event_slots WHERE event_id = $1 AND label = $2', [
+                eventId,
+                timeSlotLabel
+            ]);
             if (!slot) return res.status(400).json({ error: 'Slot not found' });
-            const free = Number(slot.capacity) - Number(slot.reserved_count || 0);
-            if (people > free) return res.status(400).json({ error: 'Slot is full' });
+            finalSlotId = slot.id;
+        } else if (slotId) {
+            const slot = await queryOne('SELECT id FROM event_slots WHERE id = $1 AND event_id = $2', [slotId, eventId]);
+            if (!slot) return res.status(400).json({ error: 'Slot not found' });
             finalSlotId = slot.id;
         }
 
@@ -450,10 +502,11 @@ app.post('/reservations', async (req, res) => {
         const status = mode === 'instant' ? 'Rezervováno' : 'Čeká na schválení';
 
         await pool.query(
-            'INSERT INTO reservations (event_id, slot_id, group_name, people_count, email, status) VALUES ($1, $2, $3, $4, $5, $6)',
-            [eventId, finalSlotId, group_name.trim(), people, email.trim(), status]
+            'INSERT INTO reservations (event_id, slot_id, timeslot, group_name, people_count, email, status) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+            [eventId, finalSlotId, timeSlotLabel, group_name.trim(), people, email.trim(), status]
         );
 
+        const slotLine = timeSlotLabel ? `\nTermín: ${timeSlotLabel}\n` : '\n';
         await sendMailSafe(
             {
                 from: process.env.MAIL_FROM || '"Farnost Přeštice" <no-reply@example.com>',
@@ -461,8 +514,8 @@ app.post('/reservations', async (req, res) => {
                 subject: mode === 'instant' ? 'Potvrzení rezervace' : 'Přijetí žádosti o rezervaci',
                 text:
                     mode === 'instant'
-                        ? `Dobrý den,\n\nvaše rezervace na jméno "${group_name.trim()}" byla potvrzena.\n\nS pozdravem,\nŘKF Přeštice`
-                        : `Dobrý den,\n\nvaše žádost o rezervaci na jméno "${group_name.trim()}" byla přijata a čeká na schválení administrátorem.\n\nS pozdravem,\nŘKF Přeštice`
+                        ? `Dobrý den,\n\nvaše rezervace na jméno "${group_name.trim()}" byla potvrzena.${slotLine}\nS pozdravem,\nŘKF Přeštice`
+                        : `Dobrý den,\n\nvaše žádost o rezervaci na jméno "${group_name.trim()}" byla přijata a čeká na schválení administrátorem.${slotLine}\nS pozdravem,\nŘKF Přeštice`
             },
             'Rezervace klient'
         );
