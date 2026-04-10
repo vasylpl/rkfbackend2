@@ -76,8 +76,17 @@ function authAdmin(req, res, next) {
 }
 
 // --- 1. DB CONNECTION ---
+const databaseUrl = process.env.DATABASE_URL;
 const pool = new Pool({
-    connectionString: process.env.DATABASE_URL
+    connectionString: databaseUrl,
+    ssl: databaseUrl && databaseUrl.includes('supabase.com') ? { rejectUnauthorized: false } : undefined
+});
+
+process.on('unhandledRejection', (reason) => {
+    console.error('unhandledRejection:', reason);
+});
+process.on('uncaughtException', (err) => {
+    console.error('uncaughtException:', err);
 });
 
 async function queryOne(text, params) {
@@ -143,6 +152,10 @@ app.post('/login', async (req, res) => {
     }
 });
 
+app.get('/health', (req, res) => {
+    return res.json({ ok: true });
+});
+
 // --- 3b. CONTACT FORM ---
 app.post('/contact', async (req, res) => {
     try {
@@ -195,7 +208,8 @@ app.get('/settings', async (req, res) => {
         if (row.ohlasky == null) row.ohlasky = '';
         res.json(row);
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        console.error('GET /settings failed:', err);
+        res.status(500).json({ error: err?.message || 'DB error' });
     }
 });
 
