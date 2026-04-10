@@ -81,7 +81,14 @@ const pool = new Pool({
     connectionString: databaseUrl,
     // Supabase pooler can present a cert chain that Node doesn't fully trust in some environments.
     // Disabling cert verification here is a pragmatic workaround for managed Postgres over TLS.
-    ssl: databaseUrl ? { rejectUnauthorized: false } : undefined
+    ssl: databaseUrl ? { rejectUnauthorized: false } : undefined,
+    // Render is a long-running service; keep pool small and connections stable.
+    max: Number(process.env.PG_POOL_MAX || 2),
+    idleTimeoutMillis: Number(process.env.PG_IDLE_TIMEOUT_MS || 30_000),
+    connectionTimeoutMillis: Number(process.env.PG_CONNECT_TIMEOUT_MS || 10_000),
+    // Helps with some network middleboxes/poolers.
+    keepAlive: true,
+    keepAliveInitialDelayMillis: Number(process.env.PG_KEEPALIVE_DELAY_MS || 10_000)
 });
 
 process.on('unhandledRejection', (reason) => {
