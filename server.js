@@ -17,6 +17,8 @@ app.use(
         origin: (origin, cb) => {
             if (!origin) return cb(null, true); // allow curl / server-to-server
             if (allowedOrigins.length === 0) return cb(null, true); // dev fallback
+            // file:// pages send Origin: "null" (string)
+            if (origin === 'null' && process.env.CORS_ALLOW_FILE === '1') return cb(null, true);
             if (allowedOrigins.includes(origin)) return cb(null, true);
             return cb(new Error('Not allowed by CORS'));
         }
